@@ -175,6 +175,7 @@
     const STORAGE_KEY_EXAMS = 'uji_aja_exams_v1';
     const STORAGE_KEY_SUBS = 'uji_aja_submissions_v1';
     const STORAGE_KEY_VIEW = 'uji_aja_viewport_v1';
+    const STORAGE_KEY_PROGRESS = 'uji_aja_in_progress_v1';
 
     function isSupabaseConfigured() {
       return (
@@ -474,12 +475,58 @@
           showToast('Gagal memuat dari database, memakai data lokal.', 'error');
         } finally {
           state.isLoading = false;
+          restoreExamProgress();
           render();
         }
       } else {
         loadLocalData();
+        restoreExamProgress();
         render();
       }
+    }
+
+    function saveExamProgress() {
+      if (state.mode !== 'student' || state.studentView !== 'taking' || !state.selectedExamId) return;
+      try {
+        localStorage.setItem(STORAGE_KEY_PROGRESS, JSON.stringify({
+          selectedExamId: state.selectedExamId,
+          studentIdentity: state.studentIdentity,
+          studentAnswers: state.studentAnswers,
+          studentFlags: state.studentFlags,
+          currentQuestionIdx: state.currentQuestionIdx,
+          examLeaveCount: state.examLeaveCount,
+          updatedAt: Date.now()
+        }));
+      } catch (e) {}
+    }
+
+    function restoreExamProgress() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY_PROGRESS);
+        if (!raw) return;
+        const p = JSON.parse(raw);
+        if (!p || !p.selectedExamId) return;
+        const ex = state.exams.find(e => e.id === p.selectedExamId && !e.archived);
+        if (!ex) {
+          clearExamProgress();
+          return;
+        }
+        state.mode = 'student';
+        state.studentView = 'taking';
+        state.selectedExamId = p.selectedExamId;
+        state.studentIdentity = p.studentIdentity || { name: '', className: '', school: '', date: todayISO() };
+        state.studentAnswers = p.studentAnswers || {};
+        state.studentFlags = p.studentFlags || {};
+        state.currentQuestionIdx = Number.isInteger(p.currentQuestionIdx) ? Math.min(Math.max(0, p.currentQuestionIdx), Math.max(0, ex.questions.length - 1)) : 0;
+        state.examLeaveCount = Number(p.examLeaveCount) || 0;
+        requestExamWakeLock();
+        showToast('Melanjutkan ujian yang sedang dikerjakan...', 'info');
+      } catch (e) {}
+    }
+
+    function clearExamProgress() {
+      try { localStorage.removeItem(STORAGE_KEY_PROGRESS); } catch (e) {}
+      releaseExamWakeLock();
     }
 
     async function persistExam(examObj, isEdit) {
@@ -740,6 +787,7 @@
     // 4. MAIN RENDER ROUTER
     // =========================================================================
     function render() {
+      if (state.mode === 'student' && state.studentView === 'taking') saveExamProgress();
       const main = document.getElementById('main-content');
       if (state.isLoading) {
         main.innerHTML = `
@@ -953,6 +1001,7 @@
       state.currentQuestionIdx = 0;
       state.examLeaveCount = 0;
       state.lastViolationAt = 0;
+      requestExamWakeLock();
       state.isAwayFromExam = false;
       state.isWarningModalOpen = false;
       state.studentView = hasTeacherNote(ex) ? 'teacher_note' : 'taking';
@@ -1408,6 +1457,7 @@
       };
 
       persistSubmission(subObj);
+      clearExamProgress();
       state.lastSubmission = subObj;
       state.studentView = 'result';
       render();
@@ -2347,22 +2397,63 @@
       };
 
       persistSubmission(subObj);
+      clearExamProgress();
       state.lastSubmission = subObj;
       state.studentView = 'result';
       showToast('Ujian berakhir otomatis karena keluar halaman 2x!', 'error');
       render();
     }
 
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        handleStudentLeaveAttempt();
-      } else if (!state.isWarningModalOpen) {
-        state.isAwayFromExam = false;
+    let examWakeLock = null;
+    let lastUserActivityAt = Date.now();
+
+    function markUserActivity() {
+      lastUserActivityAt = Date.now();
+    }
+    ['pointerdown', 'touchstart', 'keydown', 'scroll', 'click'].forEach(evt => {
+      document.addEventListener(evt, markUserActivity, { passive: true });
+    });
+
+    async function requestExamWakeLock() {
+      if (state.mode !== 'student' || state.studentView !== 'taking') return;
+      if ('wakeLock' in navigator) {
+        try {
+          if (!examWakeLock) {
+            examWakeLock = await navigator.wakeLock.request('screen');
+            examWakeLock.addEventListener('release', () => { examWakeLock = null; });
+          }
+        } catch (e) {}
+      }
+    }
+
+    function releaseExamWakeLock() {
+      if (examWakeLock) {
+        try { examWakeLock.release(); } catch (e) {}
+        examWakeLock = null;
+      }
+    }
+
+    document.addEventListener('input', () => {
+      if (state.mode === 'student' && state.studentView === 'taking') {
+        saveExamProgress();
       }
     });
-    window.addEventListener('blur', () => {
-      handleStudentLeaveAttempt();
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        // Jika layar HP mati otomatis karena dibiarkan diam (>= 10 detik tanpa sentuhan), jangan hitung keluar web
+        const idleMs = Date.now() - lastUserActivityAt;
+        if (idleMs < 10000) {
+          handleStudentLeaveAttempt();
+        }
+      } else {
+        if (!state.isWarningModalOpen) {
+          state.isAwayFromExam = false;
+        }
+        requestExamWakeLock();
+      }
     });
+
     window.addEventListener('focus', () => {
       if (!state.isWarningModalOpen) {
         state.isAwayFromExam = false;
